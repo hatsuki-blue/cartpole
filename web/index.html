@@ -1,0 +1,369 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>棒立てを学ぶAI</title>
+<style>
+  :root { --bg: #0b1020; --panel: #141b3d; --line: #3a4a85; --text: #e8ecff; --sub: #c8d2ff; --accent: #7fd4ff; --good: #7dffb0; --warn: #ffe066; --bad: #ff6b7a; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; min-height: 100%; background: var(--bg); color: var(--text); font-family: "Yu Gothic UI", "Meiryo", sans-serif; }
+  header { padding: 12px 16px 4px; display: flex; align-items: baseline; gap: 16px; flex-wrap: wrap; }
+  h1 { margin: 0; font-size: 24px; }
+  header p { margin: 0; color: var(--sub); font-size: 15px; }
+  #grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 12px; padding: 8px 16px; }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 10px; display: flex; flex-direction: column; gap: 6px; transition: border-color .2s; }
+  .panel.fail { border-color: var(--bad); }
+  .panel h2 { margin: 0; font-size: 20px; display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+  .panel h2 small { font-size: 13px; font-weight: normal; color: var(--sub); }
+  .panel canvas { width: 100%; height: 220px; display: block; cursor: pointer; border-radius: 8px; background: #0e1430; }
+  .stats { display: flex; justify-content: space-between; font-size: 15px; color: var(--sub); }
+  .stats b { color: var(--text); font-size: 22px; }
+  .think { font-size: 13px; color: var(--sub); display: flex; align-items: center; gap: 6px; }
+  .gauge { flex: 1; height: 12px; background: #0e1430; border-radius: 6px; position: relative; overflow: hidden; }
+  .gauge i { position: absolute; top: 0; bottom: 0; background: var(--accent); }
+  .gauge::after { content: ""; position: absolute; left: 50%; top: 0; bottom: 0; width: 1px; background: var(--line); }
+  select, button { font: inherit; font-size: 15px; padding: 6px 12px; border-radius: 8px; border: 1px solid #4a5a9a; background: #1a2350; color: var(--text); cursor: pointer; }
+  button:hover { background: #26337a; }
+  button:active { background: #3552d8; }
+  #controls { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; padding: 4px 16px; }
+  #controls label { color: var(--sub); font-size: 15px; display: flex; align-items: center; gap: 6px; }
+  #controls .sep { width: 1px; height: 28px; background: var(--line); margin: 0 4px; }
+  #curveWrap { padding: 8px 16px 16px; }
+  #curve { width: 100%; height: 200px; display: block; background: var(--panel); border: 1px solid var(--line); border-radius: 12px; }
+  .human-btns { display: flex; gap: 8px; }
+  .human-btns button { flex: 1; font-size: 18px; padding: 10px; touch-action: none; user-select: none; }
+  #missing { padding: 40px 16px; font-size: 18px; line-height: 1.8; }
+  code { background: #1a2350; padding: 2px 6px; border-radius: 4px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>棒立てを学ぶAI</h1>
+  <p>強化学習(DQN)で、台車を左右に押して棒を倒さないコツを覚えたAIです。練習の量でどれだけ変わるか見比べてみよう。</p>
+</header>
+<div id="controls">
+  <button id="pokeL">← みんなの棒をつつく</button>
+  <button id="pokeR">みんなの棒をつつく →</button>
+  <span class="sep"></span>
+  <label>棒の長さ
+    <select id="len"><option value="0.5">ふつう(練習と同じ)</option><option value="1.0">長い</option><option value="0.25">短い</option></select>
+  </label>
+  <label>重力
+    <select id="grav"><option value="9.8">地球(練習と同じ)</option><option value="1.62">月</option><option value="24.8">木星</option></select>
+  </label>
+  <span class="sep"></span>
+  <button id="resetAll">全部リセット</button>
+</div>
+<div id="grid"></div>
+<div id="curveWrap"><canvas id="curve"></canvas></div>
+
+<script src="models.js"></script>
+<script src="models_robust.js"></script>
+<script>
+"use strict";
+const DATA = window.CARTPOLE_DATA;
+const DATA_R = window.CARTPOLE_DATA_ROBUST;   // いじわる付きで鍛えたAI(なくても動く)
+if (!DATA) {
+  document.getElementById("grid").outerHTML =
+    '<div id="missing">学習データ <code>models.js</code> がありません。<br>' +
+    '学習用PCで <code>python train.py</code> を実行して、できた <code>web/models.js</code> をこのフォルダに置いてください。</div>';
+  throw new Error("models.js not found");
+}
+
+// ---- 物理(gymnasium の CartPole-v1 と同じ式) ----
+const TAU = 0.02, FORCE = 10, MC = 1.0, MP = 0.1;
+const X_LIMIT = 2.4, TH_LIMIT = 12 * Math.PI / 180;
+const world = { len: 0.5, g: 9.8 };   // len は棒の長さの半分
+
+function newState() {
+  const r = () => (Math.random() - 0.5) * 0.1;
+  return { x: r(), xd: r(), th: r(), thd: r() };
+}
+function physStep(s, force) {
+  const total = MC + MP, pml = MP * world.len;
+  const c = Math.cos(s.th), sn = Math.sin(s.th);
+  const temp = (force + pml * s.thd * s.thd * sn) / total;
+  const thacc = (world.g * sn - c * temp) / (world.len * (4 / 3 - MP * c * c / total));
+  const xacc = temp - pml * thacc * c / total;
+  s.x += TAU * s.xd; s.xd += TAU * xacc;
+  s.th += TAU * s.thd; s.thd += TAU * thacc;
+}
+const failed = s => Math.abs(s.x) > X_LIMIT || Math.abs(s.th) > TH_LIMIT;
+
+// ---- ニューラルネット(学習済みの重みで前向き計算だけする) ----
+function forward(layers, input) {
+  let h = input;
+  layers.forEach((L, li) => {
+    const out = L.b.slice();
+    for (let j = 0; j < out.length; j++) {
+      const w = L.W[j];
+      let sum = out[j];
+      for (let k = 0; k < h.length; k++) sum += w[k] * h[k];
+      out[j] = li < layers.length - 1 ? Math.max(0, sum) : sum;
+    }
+    h = out;
+  });
+  return h;
+}
+
+// ---- 表示するAIの選び方 ----
+DATA.snapshots.forEach(s => { s.robust = false; });
+if (DATA_R) DATA_R.snapshots.forEach(s => { s.robust = true; });
+const snaps = DATA.snapshots.concat(DATA_R ? DATA_R.snapshots : []);
+const normalSnaps = DATA.snapshots;
+const bestSnap = normalSnaps.find(s => s.label === "best") || normalSnaps[normalSnaps.length - 1];
+const firstSnap = normalSnaps.find(s => s.episode === 0) || normalSnaps[0];
+const midCandidates = normalSnaps.filter(s => s !== firstSnap && s.label !== "best" && s.episode < bestSnap.episode);
+const midSnap = midCandidates.length
+  ? midCandidates.reduce((a, b) => Math.abs(b.eval - 100) < Math.abs(a.eval - 100) ? b : a)
+  : normalSnaps[Math.floor(normalSnaps.length / 2)];
+const robustBest = DATA_R && (DATA_R.snapshots.find(s => s.label === "best") || DATA_R.snapshots[DATA_R.snapshots.length - 1]);
+const snapName = s => (s.robust ? "【鍛えた】" : "") + (s.label === "best" ? `完成版(${s.episode}回練習)` : `${s.episode}回練習`);
+
+// ---- パネル ----
+const grid = document.getElementById("grid");
+const panels = [];
+function makePanel(title, snap, human) {
+  const el = document.createElement("div");
+  el.className = "panel";
+  el.innerHTML = `
+    <h2><span class="t"></span><small class="ev"></small></h2>
+    ${human ? "" : '<select class="pick"></select>'}
+    <canvas></canvas>
+    <div class="stats"><span>いま <b class="now">0.0</b> 秒</span><span>最高 <b class="best">0.0</b> 秒</span><span>失敗 <b class="fails">0</b></span></div>
+    ${human
+      ? '<div class="human-btns"><button class="hl">← 押す</button><button class="hr">押す →</button></div><div class="think">キーボードの ← → でも操作できます</div>'
+      : '<div class="think">AIの考え ←<span class="gauge"><i></i></span>→</div>'}`;
+  grid.appendChild(el);
+  const p = {
+    el, human, snap, title,
+    canvas: el.querySelector("canvas"),
+    state: newState(), steps: 0, best: 0, fails: 0, failT: 0, lastQ: [0, 0], lastA: 0,
+  };
+  el.querySelector(".t").textContent = title;
+  if (!human) {
+    const sel = el.querySelector(".pick");
+    snaps.forEach((s, i) => {
+      const o = document.createElement("option");
+      o.value = i; o.textContent = `${snapName(s)} ― テスト平均 ${(s.eval * TAU).toFixed(1)} 秒`;
+      if (s === snap) o.selected = true;
+      sel.appendChild(o);
+    });
+    sel.onchange = () => { p.snap = snaps[+sel.value]; resetPanel(p, true); updateHeader(p); drawCurve(); };
+  } else {
+    const hold = (btn, dir) => {
+      btn.addEventListener("pointerdown", e => { e.preventDefault(); keys[dir] = true; });
+      ["pointerup", "pointerleave", "pointercancel"].forEach(ev => btn.addEventListener(ev, () => { keys[dir] = false; }));
+    };
+    hold(el.querySelector(".hl"), "left");
+    hold(el.querySelector(".hr"), "right");
+  }
+  p.canvas.addEventListener("click", e => {
+    const r = p.canvas.getBoundingClientRect();
+    poke(p, e.clientX - r.left < r.width / 2 ? -1 : 1);
+  });
+  updateHeader(p);
+  panels.push(p);
+  return p;
+}
+function updateHeader(p) {
+  p.el.querySelector(".ev").textContent = p.human ? "あなたが台車を押します"
+    : `練習 ${p.snap.episode} 回` + (p.snap.robust ? "(いじわるあり)" : "");
+}
+function resetPanel(p, clearRecord) {
+  p.state = newState(); p.steps = 0; p.failT = 0;
+  if (clearRecord) { p.best = 0; p.fails = 0; }
+  p.el.classList.remove("fail");
+}
+function poke(p, dir) { if (p.failT <= 0) p.state.thd += dir * 0.6; }
+
+const keys = { left: false, right: false };
+window.addEventListener("keydown", e => {
+  if (e.key === "ArrowLeft") { keys.left = true; e.preventDefault(); }
+  if (e.key === "ArrowRight") { keys.right = true; e.preventDefault(); }
+});
+window.addEventListener("keyup", e => {
+  if (e.key === "ArrowLeft") keys.left = false;
+  if (e.key === "ArrowRight") keys.right = false;
+});
+
+makePanel("学習前のAI", firstSnap, false);
+makePanel("練習中のAI", midSnap, false);
+makePanel("完成したAI", bestSnap, false);
+if (robustBest) makePanel("鍛えたAI", robustBest, false);
+makePanel("あなた", null, true);
+
+document.getElementById("pokeL").onclick = () => panels.forEach(p => !p.human && poke(p, -1));
+document.getElementById("pokeR").onclick = () => panels.forEach(p => !p.human && poke(p, 1));
+document.getElementById("len").onchange = e => { world.len = +e.target.value; panels.forEach(p => resetPanel(p, true)); };
+document.getElementById("grav").onchange = e => { world.g = +e.target.value; panels.forEach(p => resetPanel(p, true)); };
+document.getElementById("resetAll").onclick = () => panels.forEach(p => resetPanel(p, true));
+
+// ---- 1ステップ進める ----
+function stepPanel(p) {
+  if (p.failT > 0) {
+    p.failT -= TAU;
+    if (p.failT <= 0) resetPanel(p, false);
+    return;
+  }
+  const s = p.state;
+  let force;
+  if (p.human) {
+    force = (keys.right ? FORCE : 0) - (keys.left ? FORCE : 0);
+  } else {
+    const q = forward(p.snap.layers, [s.x, s.xd, s.th, s.thd]);
+    p.lastQ = q;
+    p.lastA = q[1] > q[0] ? 1 : 0;
+    force = p.lastA === 1 ? FORCE : -FORCE;
+  }
+  physStep(s, force);
+  p.steps++;
+  if (failed(s)) {
+    p.fails++;
+    p.failT = 0.7;
+    p.el.classList.add("fail");
+  }
+  p.best = Math.max(p.best, p.steps);
+}
+
+// ---- 描画 ----
+function fitCanvas(c) {
+  const dpr = window.devicePixelRatio || 1;
+  const w = Math.round(c.clientWidth * dpr), h = Math.round(c.clientHeight * dpr);
+  if (c.width !== w || c.height !== h) { c.width = w; c.height = h; }
+  const ctx = c.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  return { ctx, w: c.clientWidth, h: c.clientHeight };
+}
+function drawPanel(p) {
+  const { ctx, w, h } = fitCanvas(p.canvas);
+  ctx.clearRect(0, 0, w, h);
+  const poleLen = world.len * 2;
+  const scale = Math.min(w / (2 * X_LIMIT + 1), (h * 0.8) / (poleLen + 0.4));
+  const cx = w / 2, ty = h * 0.82;
+  const X = x => cx + x * scale;
+  // レール
+  ctx.strokeStyle = "#3a4a85"; ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.moveTo(X(-X_LIMIT), ty); ctx.lineTo(X(X_LIMIT), ty); ctx.stroke();
+  ctx.strokeStyle = "#ff6b7a"; ctx.setLineDash([4, 4]); ctx.lineWidth = 2;
+  [-X_LIMIT, X_LIMIT].forEach(x => { ctx.beginPath(); ctx.moveTo(X(x), ty + 12); ctx.lineTo(X(x), ty - h * 0.5); ctx.stroke(); });
+  ctx.setLineDash([]);
+  // 台車
+  const s = p.state;
+  const cw = 0.5 * scale, ch = 0.28 * scale;
+  const failing = p.failT > 0;
+  ctx.fillStyle = failing ? "#ff6b7a" : "#8fb4ff";
+  ctx.fillRect(X(s.x) - cw / 2, ty - ch, cw, ch);
+  // 棒
+  const px = X(s.x), py = ty - ch;
+  const ex = px + Math.sin(s.th) * poleLen * scale, ey = py - Math.cos(s.th) * poleLen * scale;
+  ctx.strokeStyle = failing ? "#ff6b7a" : "#ffe066"; ctx.lineWidth = Math.max(4, scale * 0.06); ctx.lineCap = "round";
+  ctx.beginPath(); ctx.moveTo(px, py); ctx.lineTo(ex, ey); ctx.stroke();
+  ctx.fillStyle = "#fff"; ctx.beginPath(); ctx.arc(px, py, 4, 0, Math.PI * 2); ctx.fill();
+  // 押している向き
+  if (!failing) {
+    let dir = 0;
+    if (p.human) dir = (keys.right ? 1 : 0) - (keys.left ? 1 : 0);
+    else dir = p.lastA === 1 ? 1 : -1;
+    if (dir) {
+      const ax = X(s.x) - dir * (cw / 2 + 8), ay = ty - ch / 2;
+      ctx.fillStyle = "#7fd4ff";
+      ctx.beginPath(); ctx.moveTo(ax, ay); ctx.lineTo(ax - dir * 14, ay - 8); ctx.lineTo(ax - dir * 14, ay + 8); ctx.closePath(); ctx.fill();
+    }
+  }
+  if (failing) {
+    ctx.fillStyle = "#ff6b7a"; ctx.font = "bold 22px sans-serif"; ctx.textAlign = "center";
+    ctx.fillText("たおれた!", w / 2, 30); ctx.textAlign = "left";
+  }
+  // 数値
+  p.el.querySelector(".now").textContent = (p.steps * TAU).toFixed(1);
+  p.el.querySelector(".best").textContent = (p.best * TAU).toFixed(1);
+  p.el.querySelector(".fails").textContent = p.fails;
+  if (!p.human) {
+    const d = p.lastQ[1] - p.lastQ[0];
+    const t = Math.tanh(d / 2) * 50;
+    const bar = p.el.querySelector(".gauge i");
+    bar.style.left = (t < 0 ? 50 + t : 50) + "%";
+    bar.style.width = Math.abs(t) + "%";
+  }
+}
+
+// ---- 学習曲線(普通/鍛えた で練習回数が大きく違うので、左右に分けてそれぞれの横軸で描く) ----
+const curve = document.getElementById("curve");
+function drawCurve() {
+  const { ctx, w, h } = fitCanvas(curve);
+  ctx.clearRect(0, 0, w, h);
+  const plots = [{ data: DATA, robust: false, name: "普通に練習", color: "#7dffb0" }];
+  if (DATA_R) plots.push({ data: DATA_R, robust: true, name: "いじわるありで練習", color: "#ff9f43" });
+  const gap = 24, outerL = 50, outerR = 16, T = 30, B = 28;
+  const pw = (w - outerL - outerR - gap * (plots.length - 1)) / plots.length;
+  const Y = v => h - B - (v / 500) * (h - T - B);
+
+  ctx.fillStyle = "#e8ecff"; ctx.font = "15px sans-serif";
+  ctx.fillText("学習のようす(灰: 1回ごとの成績 / 色の線: 平均)", outerL, 20);
+  ctx.fillStyle = "#c8d2ff"; ctx.font = "12px sans-serif";
+  [0, 250, 500].forEach(v => ctx.fillText((v * TAU) + "秒", 8, Y(v) + 4));
+
+  plots.forEach((pl, k) => {
+    const R = pl.data.returns, n = R.length;
+    const x0 = outerL + k * (pw + gap), x1 = x0 + pw;
+    const X = i => x0 + (i / Math.max(1, n)) * pw;
+    ctx.strokeStyle = "#3a4a85"; ctx.lineWidth = 1;
+    [0, 250, 500].forEach(v => { ctx.beginPath(); ctx.moveTo(x0, Y(v)); ctx.lineTo(x1, Y(v)); ctx.stroke(); });
+    ctx.fillStyle = pl.color; ctx.font = "13px sans-serif";
+    ctx.fillText(`${pl.name}(${n}回)`, x0, h - 8);
+    ctx.fillStyle = "#c8d2ff"; ctx.textAlign = "right";
+    ctx.fillText("練習回数 →", x1, h - 8); ctx.textAlign = "left";
+
+    // 1回ごとの成績(多いときは 1px ごとに間引く)
+    const stride = Math.max(1, Math.floor(n / pw));
+    ctx.strokeStyle = "rgba(200,210,255,.3)"; ctx.beginPath();
+    for (let i = 0; i < n; i += stride) i ? ctx.lineTo(X(i), Y(R[i])) : ctx.moveTo(X(i), Y(R[i]));
+    ctx.stroke();
+    // 移動平均(練習回数が多いほど窓を広げてなめらかに)
+    const win = Math.max(20, Math.round(n / 100));
+    ctx.strokeStyle = pl.color; ctx.lineWidth = 2.5; ctx.beginPath();
+    let sum = 0;
+    for (let i = 0; i < n; i++) {
+      sum += R[i]; if (i >= win) sum -= R[i - win];
+      if (i % stride && i !== n - 1) continue;
+      const m = sum / Math.min(i + 1, win);
+      i ? ctx.lineTo(X(i), Y(m)) : ctx.moveTo(X(i), Y(m));
+    }
+    ctx.stroke();
+
+    // いま表示しているAIの位置。ラベルが重なるときは段をずらす
+    const placed = [];
+    ctx.font = "13px sans-serif";
+    panels.filter(p => !p.human && p.snap.robust === pl.robust).forEach(p => {
+      const x = X(p.snap.episode);
+      ctx.strokeStyle = pl.color; ctx.setLineDash([4, 4]); ctx.lineWidth = 1.5;
+      ctx.beginPath(); ctx.moveTo(x, T); ctx.lineTo(x, h - B); ctx.stroke(); ctx.setLineDash([]);
+      const tw = ctx.measureText(p.title).width + 8;
+      const lx = Math.min(Math.max(x - tw / 2, x0), x1 - tw);
+      let row = 0;
+      while (placed.some(r => r.row === row && lx < r.x + r.w && r.x < lx + tw)) row++;
+      placed.push({ x: lx, w: tw, row });
+      const ly = T + 4 + row * 17;
+      ctx.fillStyle = "rgba(20,27,61,.85)"; ctx.fillRect(lx, ly - 1, tw, 16);
+      ctx.fillStyle = pl.color; ctx.fillText(p.title, lx + 4, ly + 11);
+    });
+  });
+}
+window.addEventListener("resize", drawCurve);
+drawCurve();
+
+// ---- ループ(実時間で 1秒 50 ステップ) ----
+let prev = performance.now(), acc = 0;
+function frame(now) {
+  acc += Math.min((now - prev) / 1000, 0.1);
+  prev = now;
+  while (acc >= TAU) { panels.forEach(stepPanel); acc -= TAU; }
+  panels.forEach(drawPanel);
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
